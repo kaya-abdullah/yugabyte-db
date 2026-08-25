@@ -167,6 +167,9 @@ class WriteQuery {
 
   Status DoCompleteExecute();
 
+  Status CheckIntraTxnWriteIdCap(
+      Tablet* tablet, const docdb::LWKeyValueWriteBatchPB& write_batch);
+
   Result<bool> SimplePrepareExecute();
   Result<bool> RedisPrepareExecute();
   Result<bool> CqlRePrepareExecuteIfNecessary();
