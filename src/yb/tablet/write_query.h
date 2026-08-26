@@ -170,6 +170,8 @@ class WriteQuery {
   Status CheckIntraTxnWriteIdCap(
       Tablet* tablet, const docdb::LWKeyValueWriteBatchPB& write_batch);
 
+  Status MaybeMarkRaftIndexWriteIdBatch();
+
   Result<bool> SimplePrepareExecute();
   Result<bool> RedisPrepareExecute();
   Result<bool> CqlRePrepareExecuteIfNecessary();
