@@ -363,6 +363,33 @@ Status TabletSplitManager::ValidateSplitCandidateTable(
                             "Backfill operation in progress, table: $0", *table);
   }
 
+  // A unique index built in SKIP_ALL mode must not split between ordering-generation
+  // activation and release: verification scans a stable tablet set. IsBackfilling() and the
+  // disabled list above cover the indexed table and are in-memory only (lost on failover);
+  // this check reads the indexed table's durable backfill-job state, so the fence holds across
+  // master failover. The tablet-side generation fence is the fail-closed layer beneath it.
+  if (table->is_index()) {
+    const auto indexed_table = catalog_manager_.GetTableInfo(table->indexed_table_id());
+    if (indexed_table) {
+      auto indexed_lock = indexed_table->LockForRead();
+      for (const auto& backfill_job : indexed_lock->pb.backfill_jobs()) {
+        if (backfill_job.unique_index_backfill_mode() !=
+                UniqueIndexBackfillMode::UNIQUE_INDEX_BACKFILL_SKIP_ALL ||
+            backfill_job.backfill_state().count(table->id()) == 0) {
+          continue;
+        }
+        auto status = STATUS_EC_FORMAT(
+            IllegalState, MasterError(MasterErrorPB::SPLIT_OR_BACKFILL_IN_PROGRESS),
+            "Unique-index backfill with deferred verification in progress; splitting is fenced "
+            "until the ordering generation is released, index table: $0", *table);
+        YB_LOG_EVERY_N_SECS(INFO, 30)
+            << "Skipping tablet splitting for index table " << table->ToString() << ": "
+            << status;
+        return status;
+      }
+    }
+  }
+
   // Check if this table hosts stateful services. Only sys_catalog and ysql tables are currently
   // marked as is_system tables. Other tables in system namespace are not marked as is_system table.
   // #15998
