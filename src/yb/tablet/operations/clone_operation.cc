@@ -50,10 +50,12 @@ Status CloneOperation::Prepare(IsLeaderSide is_leader_side) {
 }
 
 Status CloneOperation::ValidateLeaderOpId(const OpId& op_id) const {
-  // Cloning is rejected while an index-backfill write-ID ordering generation is active: the
-  // clone would inherit an active generation with no backfill job attached, permanently fencing
-  // its splits and pinning its retention. Backfill is expected to be short-lived relative to
-  // clone scheduling, so callers retry after the generation is released.
+  // Cloning is rejected while an index-backfill write-ID ordering generation is active. The
+  // clone's data comes from hard-linked snapshot files containing generation-scoped marked
+  // write IDs, but its metadata is built fresh (RaftGroupMetadata::CreateNew, not a superblock
+  // copy), so the clone would carry marked versions with no generation record describing them
+  // and no backfill job tracking their lifecycle. Backfill is expected to be short-lived
+  // relative to clone scheduling, so callers retry after the generation is released.
   const auto generation =
       VERIFY_RESULT(tablet_safe())->metadata()->index_backfill_ordering_generation();
   SCHECK(
