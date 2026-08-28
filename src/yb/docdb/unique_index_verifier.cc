@@ -81,7 +81,15 @@ class Verifier {
         key_bounds_(key_bounds),
         schema_packing_provider_(schema_packing_provider),
         options_(options),
-        iter_(regular_db, rocksdb::ReadOptions(), &key_bounds_) {}
+        iter_(regular_db, VerifierReadOptions(), &key_bounds_) {}
+
+  // The scan is a one-shot pass over history that regular reads never touch; keep it from
+  // evicting the working set.
+  static rocksdb::ReadOptions VerifierReadOptions() {
+    rocksdb::ReadOptions read_options;
+    read_options.fill_cache = false;
+    return read_options;
+  }
 
   Result<UniqueIndexVerificationResult> Run() {
     if (!options_.start_dockey.empty()) {
@@ -186,7 +194,7 @@ class Verifier {
    public:
     SectionCursor(rocksdb::DB* db, const KeyBounds* key_bounds, std::string section_prefix)
         : section_prefix_(std::move(section_prefix)),
-          iter_(db, rocksdb::ReadOptions(), key_bounds) {
+          iter_(db, Verifier::VerifierReadOptions(), key_bounds) {
       // No valid key byte is kMaxByte, so prefix + kMaxByte seeks past every key of the
       // section (same construction as the compaction code's ranged deletes).
       std::string past_section = section_prefix_;
