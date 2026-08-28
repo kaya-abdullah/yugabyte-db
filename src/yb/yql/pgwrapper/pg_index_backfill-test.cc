@@ -1494,7 +1494,8 @@ class PgIndexBackfillVerifier : public PgIndexBackfillSkipAllRaftOrdering {
   // Runs the verification scan over the (single-tablet) index through the leader's admin
   // proxy: window = [birth_time from the master's backfill status, now].
   Result<tserver::VerifyUniqueIndexTabletResponsePB> VerifyIndexTablet(
-      const std::string& index_name) {
+      const std::string& index_name,
+      const std::function<void(tserver::VerifyUniqueIndexTabletRequestPB*)>& mutate_req = {}) {
     auto client = VERIFY_RESULT(cluster_->CreateClient());
     const auto index_table_id = VERIFY_RESULT(
         GetTableIdByTableName(client.get(), kDatabaseName, index_name));
@@ -1533,8 +1534,11 @@ class PgIndexBackfillVerifier : public PgIndexBackfillSkipAllRaftOrdering {
         std::chrono::system_clock::now().time_since_epoch()).count();
     req.set_verify_upper_ht(HybridTime::FromMicros(now_micros).ToUint64());
     req.set_index_table_id(index_table_id);
-    // No generation_base_op_index: the coordinator part supplies it strictly; the test
-    // accepts any active generation for this index table.
+    // No generation_base_op_index by default: tests accept any active generation for this
+    // index table (the coordinator omits it too -- see VerifyUniqueIndexForTablet).
+    if (mutate_req) {
+      mutate_req(&req);
+    }
 
     tserver::VerifyUniqueIndexTabletResponsePB resp;
     rpc::RpcController rpc;
@@ -1674,6 +1678,147 @@ TEST_P(PgIndexBackfillVerifierReleased, VerifyAfterReleaseFailsCleanly) {
   const auto result = VerifyIndexTablet(kIndexName);
   ASSERT_NOK(result);
   ASSERT_STR_CONTAINS(result.status().ToString(), "ordering generation");
+}
+
+// Generation-reference mismatches fail cleanly without scanning.
+TEST_P(PgIndexBackfillVerifier, GenerationMismatchFailsCleanly) {
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat("INSERT INTO $0 VALUES (1, 1)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b HASH) SPLIT INTO 1 TABLETS", kIndexName, kTableName));
+
+  const auto table_mismatch = VerifyIndexTablet(
+      kIndexName, [](tserver::VerifyUniqueIndexTabletRequestPB* req) {
+        req->set_index_table_id("not-the-generation-owner");
+      });
+  ASSERT_NOK(table_mismatch);
+  ASSERT_STR_CONTAINS(table_mismatch.status().ToString(), "different index table");
+
+  const auto base_mismatch = VerifyIndexTablet(
+      kIndexName, [](tserver::VerifyUniqueIndexTabletRequestPB* req) {
+        req->set_generation_base_op_index(std::numeric_limits<int64_t>::max());
+      });
+  ASSERT_NOK(base_mismatch);
+  ASSERT_STR_CONTAINS(base_mismatch.status().ToString(), "different base");
+}
+
+// Shadow verification: the coordinator runs the scan observationally after a SKIP_ALL build,
+// records the outcome durably, and never gates publication.
+class PgIndexBackfillShadowVerification : public PgIndexBackfillSkipAllRaftOrdering {
+ public:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgIndexBackfillSkipAllRaftOrdering::UpdateMiniClusterOptions(options);
+    options->extra_master_flags.push_back("--ysql_index_backfill_shadow_verification=true");
+    options->extra_tserver_flags.push_back("--timestamp_history_retention_interval_sec=900");
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(, PgIndexBackfillShadowVerification, ::testing::Bool());
+
+TEST_P(PgIndexBackfillShadowVerification, CleanOutcomeRecordedMultiTablet) {
+  auto clean_waiter = cluster_->GetMasterLogWaiter(": VERIFY_CLEAN");
+
+  constexpr auto kNumRows = 300;
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE TABLE $0 (a int, b int, PRIMARY KEY (a ASC)) $1", kTableName,
+      GenerateSplitClause(kNumRows, /* num_tablets= */ 4)));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, $1) g", kTableName, kNumRows));
+  // Multiple index tablets: the coordinator fans out and joins per tablet.
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b HASH) SPLIT INTO 3 TABLETS", kIndexName, kTableName));
+
+  ASSERT_OK(clean_waiter.WaitFor(MonoDelta::FromSeconds(60)));
+  ASSERT_OK(CheckIndexConsistency(kIndexName));
+}
+
+TEST_P(PgIndexBackfillShadowVerification, ViolationRecordedButDoesNotBlockPublication) {
+  auto violation_waiter = cluster_->GetMasterLogWaiter("NOT CLEAN: VERIFY_VIOLATION");
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 20) g", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat("INSERT INTO $0 VALUES (100, 5)", kTableName));  // dup b = 5.
+
+  // Shadow semantics: the build still succeeds and the index is published; the violation is
+  // recorded and logged. The fail-closed gate is a later part.
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b HASH) SPLIT INTO 1 TABLETS", kIndexName, kTableName));
+  ASSERT_OK(violation_waiter.WaitFor(MonoDelta::FromSeconds(60)));
+
+  ASSERT_OK(conn_->Execute("SET enable_seqscan = off"));
+  ASSERT_RESULT(conn_->FetchRow<int32_t>(
+      Format("SELECT a FROM $0 WHERE b = 3", kTableName)));
+}
+
+// L1 pagination pass-through: one DocKey group per RPC forces the coordinator through the
+// resume-key path on every tablet.
+class PgIndexBackfillShadowVerificationPaginated : public PgIndexBackfillShadowVerification {
+ public:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgIndexBackfillShadowVerification::UpdateMiniClusterOptions(options);
+    options->extra_master_flags.push_back(
+        "--index_backfill_shadow_verification_dockey_groups_per_rpc=1");
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(, PgIndexBackfillShadowVerificationPaginated, ::testing::Bool());
+
+// Failover mid-phase: the durable verification state (persisted window, clean-tablet set) is
+// what makes resume-with-the-same-window possible; this pins it end to end.
+class PgIndexBackfillShadowVerificationFailover : public PgIndexBackfillShadowVerification {
+ public:
+  void UpdateMiniClusterOptions(ExternalMiniClusterOptions* options) override {
+    PgIndexBackfillShadowVerification::UpdateMiniClusterOptions(options);
+    options->num_masters = 3;
+  }
+
+  int GetNumMasters() const override { return 3; }
+};
+
+INSTANTIATE_TEST_CASE_P(, PgIndexBackfillShadowVerificationFailover, ::testing::Bool());
+
+TEST_P(PgIndexBackfillShadowVerificationFailover, ResumesWithPersistedWindowAcrossFailover) {
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 50) g", kTableName));
+
+  // Hold the verification RPCs open (retryable rejection) so the phase is durably
+  // IN_PROGRESS when the master leader steps down.
+  ASSERT_OK(cluster_->SetFlagOnTServers("TEST_pause_verify_unique_index_tablet_rpc", "true"));
+  {
+    // Scoped: a daemon holds one log listener, and the resume waiter below must be attached
+    // BEFORE the stepdown -- the new leader resumes within seconds of election.
+    auto start_waiter = cluster_->GetMasterLogWaiter("Starting shadow verification");
+    thread_holder_.AddThreadFunctor([this] {
+      auto create_conn = ASSERT_RESULT(Connect());
+      ASSERT_OK(create_conn.ExecuteFormat(
+          "CREATE UNIQUE INDEX $0 ON $1 (b HASH) SPLIT INTO 1 TABLETS", kIndexName, kTableName));
+    });
+    ASSERT_OK(start_waiter.WaitFor(MonoDelta::FromSeconds(60)));
+  }
+
+  // The new leader resumes the persisted job: same window, previously clean tablets skipped.
+  auto resume_waiter = cluster_->GetMasterLogWaiter("Resuming shadow verification");
+  ASSERT_OK(cluster_->StepDownMasterLeaderAndWaitForNewLeader());
+  ASSERT_OK(cluster_->SetFlagOnTServers("TEST_pause_verify_unique_index_tablet_rpc", "false"));
+  ASSERT_OK(resume_waiter.WaitFor(MonoDelta::FromSeconds(120)));
+
+  thread_holder_.JoinAll();
+  ASSERT_OK(CheckIndexConsistency(kIndexName));
+}
+
+TEST_P(PgIndexBackfillShadowVerificationPaginated, CleanAcrossManyRpcs) {
+  auto clean_waiter = cluster_->GetMasterLogWaiter(": VERIFY_CLEAN");
+
+  ASSERT_OK(conn_->ExecuteFormat("CREATE TABLE $0 (a int PRIMARY KEY, b int)", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "INSERT INTO $0 SELECT g, g FROM generate_series(1, 50) g", kTableName));
+  ASSERT_OK(conn_->ExecuteFormat(
+      "CREATE UNIQUE INDEX $0 ON $1 (b HASH) SPLIT INTO 1 TABLETS", kIndexName, kTableName));
+
+  ASSERT_OK(clean_waiter.WaitFor(MonoDelta::FromSeconds(60)));
+  ASSERT_OK(CheckIndexConsistency(kIndexName));
 }
 
 class PgIndexBackfillBlockIndisready : public PgIndexBackfillTest {
